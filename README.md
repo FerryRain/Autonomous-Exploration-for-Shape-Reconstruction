@@ -3,7 +3,7 @@
 > Official code repository for the paper  
 > **“Autonomous Exploration for Shape Reconstruction and Measurement via Informative Contact-Guided Planning”**.
 
-🔗 **Project Page:** [https://aesrm.github.io/](https://aesrm.github.io
+🔗 **Project Page:**  [https://aesrm.github.io](https://aesrm.github.io)
 
 
 📄 **Paper:** Accepted by IEEE Robotics and Automation Letters (RA-L). (link will be added after the official publication)
@@ -23,5 +23,6 @@ If you find this work useful in your research, please consider citing our paper:
   journal = {IEEE Robotics and Automation Letters},
   year    = {2025}
 }
+
 
 

@@ -22,7 +22,9 @@ If you find this work useful in your research, please consider citing our paper:
   author  = {Zhao, Feiyu and Xiao, Chenxi},
   journal = {IEEE Robotics and Automation Letters},
   year    = {2025}
+  doi     = {10.1109/LRA.2025.3641100}
 }
+```
 
 
 

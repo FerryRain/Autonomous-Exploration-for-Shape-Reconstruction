@@ -1,4 +1,4 @@
-# Autonomous Exploration for Shape Reconstruction and Measurement via Informative Contact-Guided Planning
+# Autonomous Exploration for Shape Reconstruction and Measurement via Informative Contact-Guided Planning (AESRM)
 
 > Official code repository for the paper  
 > **“Autonomous Exploration for Shape Reconstruction and Measurement via Informative Contact-Guided Planning”**.
@@ -25,6 +25,7 @@ If you find this work useful in your research, please consider citing our paper:
   doi     = {10.1109/LRA.2025.3641100}
 }
 ```
+
 
 
 

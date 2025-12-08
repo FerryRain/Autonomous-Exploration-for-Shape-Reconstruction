@@ -5,6 +5,8 @@
 
 🔗 **Project Page:**  [https://aesrm.github.io](https://aesrm.github.io)
 
+🔗 **Simulation Testbed:**  [Probe Exploration](https://github.com/FerryRain/Probe_Exlporation)
+
 
 📄 **Paper:**  [Accepted by IEEE Robotics and Automation Letters (RA-L)](https://doi.org/10.1109/LRA.2025.3641100)
 
@@ -25,6 +27,7 @@ If you find this work useful in your research, please consider citing our paper:
   doi     = {10.1109/LRA.2025.3641100}
 }
 ```
+
 
 
 

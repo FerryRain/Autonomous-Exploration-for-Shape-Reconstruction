@@ -2340,3 +2340,299 @@ class HER_GPIS_Uncertainty_wo_dummy(HER_GPIS_Uncertainty_draw):
             loss = -mll(output, y)
             loss.backward()
             optimizer.step()
+
+
+class HER_GPIS_Uncertainty_Online(HER_GPIS_Uncertainty_draw):
+    """Memory-aware online HER-GPIS with warm-started hyperparameters.
+
+    The exploration GP (E-GPIS) is created once. New observations replace its
+    training data through ``set_train_data``; kernel/likelihood parameters are
+    fine-tuned only every ``e_hyperparameter_update_interval`` data updates.
+
+    The reconstruction GP (R-GPIS) follows the same warm-start strategy and is
+    placed on CPU by default so that it does not compete with E-GPIS for GPU
+    memory. Existing HER-GPIS classes are intentionally left unchanged.
+    """
+
+    def __init__(self, res, display_percentile_low, display_percentile_high, training_iter, grid_count, min_data,
+                 max_data, points_num, intervals, r_res=100, r_k_nearest=4, r_display_percentile_low=0,
+                 r_training_iter=40, r_grid_count=10, show_points=False, store=False, store_path=None,
+                 store_times=10, e_hyperparameter_update_interval=10, e_finetune_iterations=5,
+                 e_initial_lr=0.1, e_finetune_lr=0.01, r_hyperparameter_update_interval=3,
+                 r_finetune_iterations=5, r_initial_lr=0.1, r_finetune_lr=0.01, r_device="cpu",
+                 max_contact_points=250, max_free_points=400, max_dummy_points=750):
+        super(HER_GPIS_Uncertainty_Online, self).__init__(
+            res, display_percentile_low, display_percentile_high, training_iter, grid_count, min_data,
+            max_data, points_num, intervals, r_res=r_res, r_k_nearest=r_k_nearest,
+            r_display_percentile_low=r_display_percentile_low, r_training_iter=r_training_iter,
+            r_grid_count=r_grid_count, show_points=show_points, store=store, store_path=store_path,
+            store_times=store_times
+        )
+
+        self.e_update_count = 0
+        self.e_hyperparameter_update_interval = max(1, int(e_hyperparameter_update_interval))
+        self.e_finetune_iterations = max(0, int(e_finetune_iterations))
+        self.e_initial_lr = float(e_initial_lr)
+        self.e_finetune_lr = float(e_finetune_lr)
+
+        self.r_update_count = 0
+        self.r_hyperparameter_update_interval = max(1, int(r_hyperparameter_update_interval))
+        self.r_finetune_iterations = max(0, int(r_finetune_iterations))
+        self.r_initial_lr = float(r_initial_lr)
+        self.r_finetune_lr = float(r_finetune_lr)
+        self.r_device = torch.device(r_device)
+
+        self.max_contact_points = max_contact_points
+        self.max_free_points = max_free_points
+        self.max_dummy_points = max_dummy_points
+
+    @staticmethod
+    def _evenly_spaced_indices(size, limit):
+        if limit is None or size <= limit:
+            return np.arange(size, dtype=np.int64)
+        if limit <= 0:
+            return np.empty((0,), dtype=np.int64)
+        return np.linspace(0, size - 1, num=int(limit), dtype=np.int64)
+
+    def _trim_e_buffers(self):
+        """Bound E-GPIS memory while retaining samples across the full history."""
+        if self.buffer_explored_x.shape[0] > 0:
+            contact_mask = self.buffer_explored_y == 0
+            free_mask = ~contact_mask
+
+            contact_x = self.buffer_explored_x[contact_mask]
+            contact_y = self.buffer_explored_y[contact_mask]
+            free_x = self.buffer_explored_x[free_mask]
+            free_y = self.buffer_explored_y[free_mask]
+
+            contact_idx = self._evenly_spaced_indices(contact_x.shape[0], self.max_contact_points)
+            free_idx = self._evenly_spaced_indices(free_x.shape[0], self.max_free_points)
+
+            x_parts, y_parts = [], []
+            if contact_idx.size:
+                x_parts.append(contact_x[contact_idx])
+                y_parts.append(contact_y[contact_idx])
+            if free_idx.size:
+                x_parts.append(free_x[free_idx])
+                y_parts.append(free_y[free_idx])
+
+            self.buffer_explored_x = np.vstack(x_parts) if x_parts else np.empty((0, 3))
+            self.buffer_explored_y = np.hstack(y_parts) if y_parts else np.empty((0,))
+
+        if self.add_points_buf.shape[0] > 0:
+            dummy_idx = self._evenly_spaced_indices(self.add_points_buf.shape[0], self.max_dummy_points)
+            self.add_points_buf = self.add_points_buf[dummy_idx]
+
+    def _build_e_training_tensors(self):
+        train_x_parts = [self.origin_X.copy()]
+        train_y_parts = [self.origin_y.copy()]
+
+        if self.buffer_explored_x.shape[0] > 0:
+            train_x_parts.append(self.buffer_explored_x.copy())
+            train_y_parts.append(self.buffer_explored_y.copy())
+
+        if self.add_points_buf.shape[0] > 0:
+            train_x_parts.append(self.add_points_buf.reshape(-1, 3).copy())
+            train_y_parts.append(np.ones((self.add_points_buf.reshape(-1, 3).shape[0],)))
+
+        train_X = np.vstack(train_x_parts)
+        train_y = np.hstack(train_y_parts)
+        X = torch.as_tensor(train_X, dtype=torch.float32, device=self.device)
+        y = torch.as_tensor(train_y, dtype=torch.float32, device=self.device)
+        return X, y
+
+    @staticmethod
+    def _set_parameter_grad(model, enabled):
+        for parameter in model.parameters():
+            parameter.requires_grad_(enabled)
+
+    def _optimize_exact_gp(self, model, likelihood, X, y, iterations, lr):
+        if iterations <= 0:
+            model.eval()
+            likelihood.eval()
+            self._set_parameter_grad(model, False)
+            return None
+
+        self._set_parameter_grad(model, True)
+        model.train()
+        likelihood.train()
+        mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        last_loss = None
+
+        for _ in range(iterations):
+            optimizer.zero_grad(set_to_none=True)
+            output = model(X)
+            loss = -mll(output, y)
+            loss.backward()
+            optimizer.step()
+            last_loss = float(loss.detach().cpu())
+
+        optimizer.zero_grad(set_to_none=True)
+        model.eval()
+        likelihood.eval()
+        self._set_parameter_grad(model, False)
+        model.prediction_strategy = None
+        del optimizer
+        del mll
+        return last_loss
+
+    def _refresh_e_model(self, count_update=False):
+        X, y = self._build_e_training_tensors()
+
+        if self.model is None:
+            self.likelihood = gpytorch.likelihoods.GaussianLikelihood().to(self.device)
+            self.model = ExactGPModel(X, y, self.likelihood).to(self.device)
+            self._optimize_exact_gp(
+                self.model, self.likelihood, X, y, self.training_iter, self.e_initial_lr
+            )
+            return
+
+        self.model.set_train_data(inputs=X, targets=y, strict=False)
+        self.model.prediction_strategy = None
+
+        if count_update:
+            self.e_update_count += 1
+
+        should_finetune = (
+            count_update
+            and self.e_finetune_iterations > 0
+            and self.e_update_count % self.e_hyperparameter_update_interval == 0
+        )
+        if should_finetune:
+            self._optimize_exact_gp(
+                self.model, self.likelihood, X, y,
+                self.e_finetune_iterations, self.e_finetune_lr
+            )
+        else:
+            self.model.eval()
+            self.likelihood.eval()
+            self._set_parameter_grad(self.model, False)
+
+    def init_gpis(self, normal, position):
+        position = np.asarray(position, dtype=np.float64).reshape(3)
+        normal = np.asarray(normal, dtype=np.float64).reshape(3)
+        self.origin_X, self.origin_y = self.init_datasets(normal, position)
+        self.buffer_explored_x = np.vstack([self.buffer_explored_x, position.reshape(1, 3)])
+        self.buffer_explored_y = np.hstack([self.buffer_explored_y, [0.0]])
+        self._trim_e_buffers()
+        self._refresh_e_model(count_update=False)
+
+    def update(self, explored_new_x, explored_new_y, normals):
+        explored_new_x = np.asarray(explored_new_x, dtype=np.float64).reshape(-1, 3)
+        explored_new_y = np.asarray(explored_new_y, dtype=np.float64).reshape(-1)
+        normals = np.asarray(normals, dtype=np.float64).reshape(-1, 3)
+
+        if explored_new_x.shape[0] != explored_new_y.shape[0]:
+            raise ValueError("explored_new_x and explored_new_y must have the same length")
+
+        self.buffer_explored_x = np.vstack([self.buffer_explored_x, explored_new_x])
+        self.buffer_explored_y = np.hstack([self.buffer_explored_y, explored_new_y])
+
+        contact_points = explored_new_x[explored_new_y == 0]
+        if contact_points.shape[0] > 0:
+            if normals.shape[0] < contact_points.shape[0]:
+                raise ValueError("A surface normal is required for every new contact point")
+            contact_normals = normals[:contact_points.shape[0]]
+            new_dummy_points = self.add_points(contact_normals, contact_points)
+            if new_dummy_points.size:
+                self.add_points_buf = np.vstack([self.add_points_buf, new_dummy_points.reshape(-1, 3)])
+
+        self._trim_e_buffers()
+        self._refresh_e_model(count_update=True)
+
+    def down_sample_points(self, r=1.0):
+        if self.buffer_explored_x.shape[0] > 0:
+            x_ds, y_ds, _ = self.downsample_radius_greedy_np(
+                self.buffer_explored_x, self.buffer_explored_y, r=r
+            )
+            self.buffer_explored_x = x_ds
+            self.buffer_explored_y = y_ds
+        self.down_sample_add_points_buf()
+        self._trim_e_buffers()
+
+        if self.model is not None and hasattr(self, "origin_X"):
+            self._refresh_e_model(count_update=False)
+
+        # Kept for compatibility with the current real-robot loop, which uses
+        # time_step to avoid entering the down-sampling branch repeatedly.
+        self.time_step += 1
+
+    def r_update(self):
+        original_points = self.buffer_explored_x[self.buffer_explored_y == 0]
+        if original_points.shape[0] == 0:
+            return
+
+        temp_min = np.min(original_points, axis=0)
+        temp_max = np.max(original_points, axis=0)
+        min_data = temp_min - (temp_max - temp_min) * 0.2
+        max_data = temp_max + (temp_max - temp_min) * 0.2
+
+        x_axis = np.linspace(min_data[0], max_data[0], self.r_grid_count)
+        y_axis = np.linspace(min_data[1], max_data[1], self.r_grid_count)
+        z_axis = np.linspace(min_data[2], max_data[2], self.r_grid_count)
+        train_X = np.asarray(
+            [[x, y, z] for x in x_axis for y in y_axis for z in z_axis],
+            dtype=np.float64
+        )
+        train_y = np.zeros((train_X.shape[0],), dtype=np.float64)
+
+        gridpcd = o3d.geometry.PointCloud()
+        gridpcd.points = o3d.utility.Vector3dVector(train_X)
+        kdtree_gridpcd = o3d.geometry.KDTreeFlann(gridpcd)
+        remove_indices = []
+        for point in original_points:
+            k, indices, _ = kdtree_gridpcd.search_knn_vector_3d(point, self.r_k_nearest)
+            remove_indices.extend(indices[:k])
+
+        if remove_indices:
+            mask = np.ones((train_X.shape[0],), dtype=bool)
+            mask[np.unique(remove_indices)] = False
+            train_X = train_X[mask]
+            train_y = train_y[mask]
+
+        train_X = np.vstack([train_X, original_points])
+        train_y = np.hstack([train_y, np.ones((original_points.shape[0],))])
+        X = torch.as_tensor(train_X, dtype=torch.float32, device=self.r_device)
+        y = torch.as_tensor(train_y, dtype=torch.float32, device=self.r_device)
+
+        self.r_update_count += 1
+        if self.r_model is None:
+            self.r_likelihood = gpytorch.likelihoods.GaussianLikelihood().to(self.r_device)
+            self.r_model = ExactGPModel(X, y, self.r_likelihood).to(self.r_device)
+            self._optimize_exact_gp(
+                self.r_model, self.r_likelihood, X, y, self.r_training_iter, self.r_initial_lr
+            )
+            return
+
+        self.r_model.set_train_data(inputs=X, targets=y, strict=False)
+        self.r_model.prediction_strategy = None
+        should_finetune = (
+            self.r_finetune_iterations > 0
+            and self.r_update_count % self.r_hyperparameter_update_interval == 0
+        )
+        if should_finetune:
+            self._optimize_exact_gp(
+                self.r_model, self.r_likelihood, X, y,
+                self.r_finetune_iterations, self.r_finetune_lr
+            )
+        else:
+            self.r_model.eval()
+            self.r_likelihood.eval()
+            self._set_parameter_grad(self.r_model, False)
+
+    def compute_gpis_normals(self, pt_np):
+        if self.r_model is None:
+            return np.zeros_like(np.asarray(pt_np, dtype=np.float64).reshape(-1, 3))
+
+        self.r_model.eval()
+        self.r_likelihood.eval()
+        x = torch.as_tensor(pt_np, dtype=torch.float32, device=self.r_device).reshape(-1, 3)
+        x.requires_grad_(True)
+        with torch.enable_grad(), gpytorch.settings.fast_pred_var(False):
+            mean = self.r_model(x).mean
+            gradients = torch.autograd.grad(
+                outputs=mean.sum(), inputs=x, create_graph=False, retain_graph=False
+            )[0]
+        normals = gradients / (gradients.norm(dim=-1, keepdim=True) + 1e-9)
+        return normals.detach().cpu().numpy()

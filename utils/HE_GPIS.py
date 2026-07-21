@@ -2369,6 +2369,9 @@ class HER_GPIS_Uncertainty_Online(HER_GPIS_Uncertainty_draw):
             store_times=store_times
         )
 
+        self.model = None
+        self.likelihood = None
+
         self.e_update_count = 0
         self.e_hyperparameter_update_interval = max(1, int(e_hyperparameter_update_interval))
         self.e_finetune_iterations = max(0, int(e_finetune_iterations))
